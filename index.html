@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Railway Radar</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+</head>
+<body>
+    <h1>Welcome to Railway Radar</h1>
+    <form class="search-form" role="search">
+        <label for="search-input" class="sr-only">Search for railway information</label>
+        <input type="search" id="search-input" name="query" placeholder="Search...">
+        <button type="submit">Search</button>
+    </form>
+    <p>Your go-to site for railway information.</p>
+    <div id="map"></div>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
