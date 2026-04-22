@@ -22,7 +22,6 @@
         
         <div class="button-group">
             <button id="location-btn" onclick="requestUserLocation()">📍 Use My Location</button>
-            <button id="archive-btn" onclick="displayArchive()">📚 Archive</button>
         </div>
 
         <div id="location-status">Location access: Not requested</div>
@@ -41,36 +40,9 @@
         <p>Search results will appear here</p>
     </div>
 
-    <!-- Archive Modal -->
-    <div id="archive-modal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeArchiveModal()">&times;</span>
-            <div id="archive-content"></div>
-        </div>
-    </div>
-
-    <!-- Google AdSense Placeholder -->
-    <div class="ad-container">
-        <div class="ad-placeholder">
-            <!-- Google AdSense Code (replace with your actual AdSense code) -->
-            <!-- <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-xxxxxxxxxxxxxxxx"
-                 crossorigin="anonymous"></script>
-            <ins class="adsbygoogle"
-                 style="display:block"
-                 data-ad-client="ca-pub-xxxxxxxxxxxxxxxx"
-                 data-ad-slot="xxxxxxxxxx"
-                 data-ad-format="auto"
-                 data-full-width-responsive="true"></ins>
-            <script>
-                 (adsbygoogle = window.adsbygoogle || []).push({});
-            </script> -->
-            <p>📺 Advertisement space - Add your Google AdSense code here</p>
-        </div>
-    </div>
-
     <footer>
         <p>Railway Radar © 2026 | Live train tracking for UK railways</p>
-        <p><small>Data provided by National Rail Enquiries. Archive data is sample only.</small></p>
+        <p><small>Data provided by National Rail Enquiries.</small></p>
     </footer>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

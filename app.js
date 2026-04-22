@@ -4,6 +4,38 @@ console.log("Railway Radar loaded");
 // Initialize the map centered on Britain
 const map = L.map('map').setView([54.7023545, -3.2765753], 6);
 
+// WebSocket real-time connection
+const socket = io();
+socket.on('trains', (data) => {
+    console.log('📡 Real-time update received from server:', data.trains?.length, 'trains');
+    
+    const statusEl = document.getElementById('location-status');
+    if (data.stale) {
+        console.warn('⚠️ Server returned stale fallback data (S3 is down)');
+        if (statusEl) {
+            statusEl.textContent = '⚠️ Offline Mode (Using Stale Data)';
+            statusEl.style.color = '#ff9900';
+        }
+    } else if (statusEl && statusEl.textContent.includes('Offline Mode')) {
+        // Reset if we recovered from being offline but don't overwrite if it says "Location access granted"
+        statusEl.textContent = '✅ Connected (Live Updates)';
+        statusEl.style.color = '#00cc00';
+    }
+
+    liveTrains = data.trains || [];
+
+    // Check if we have active search query to filter
+    const query = document.getElementById('search-input')?.value?.toLowerCase()?.trim();
+    if (query) {
+        performSearch(query); // update view with filtered trains
+    } else {
+        // Option 1: Don't display anything if no search
+        // Option 2: If we had a view showing them all, we could do displayTrains(liveTrains)
+        console.log('⏳ Update stored in background, waiting for search');
+        // displayTrains(liveTrains);
+    }
+});
+
 // Add OpenStreetMap tiles
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '© OpenStreetMap contributors'
@@ -117,10 +149,23 @@ async function fetchLiveTrains() {
         
         const data = await response.json();
         console.log('📡 API Response received:', data);
-        console.log('🚂 Trains array:', data.trains);
+        console.log('🚆 Trains array:', data.trains);
         console.log('📊 Number of trains:', data.trains ? data.trains.length : 0);
-        if (data.error) {
-            console.warn('⚠️  API Error:', data.error);
+        
+        const statusEl = document.getElementById('location-status');
+        if (data.stale) {
+            console.warn('⚠️ API returned stale fallback data (S3 is down). Reason:', data.error);
+            if (statusEl) {
+                statusEl.textContent = '⚠️ Offline Mode (Using Stale Data)';
+                statusEl.style.color = '#ff9900';
+            }
+        } else if (statusEl && statusEl.textContent.includes('Offline Mode')) {
+            statusEl.textContent = '✅ Connected (Live Updates)';
+            statusEl.style.color = '#00cc00';
+        }
+
+        if (data.error && !data.stale) {
+            console.warn('⚠️ API Error:', data.error);
         }
         return data.trains || [];
     } catch (error) {
@@ -216,25 +261,20 @@ function updateTrainList(trains) {
 }
 
 // ============================================
-// STATION DATABASE (public data)
+// STATION DATABASE (public data loaded from API)
 // ============================================
-const ukStations = [
-    { name: 'London King\'s Cross', code: 'KGX', lat: 51.5307, lng: -0.1234 },
-    { name: 'London St Pancras', code: 'STP', lat: 51.5330, lng: -0.1254 },
-    { name: 'King\'s Cross St Pancras', code: 'KGX', lat: 51.5320, lng: -0.1244 },
-    { name: 'Birmingham New Street', code: 'BHM', lat: 52.5079, lng: -1.9038 },
-    { name: 'Manchester Piccadilly', code: 'MAN', lat: 53.4779, lng: -2.2298 },
-    { name: 'Liverpool Lime Street', code: 'LIV', lat: 53.4073, lng: -2.9616 },
-    { name: 'Edinburgh Waverley', code: 'EDB', lat: 55.9545, lng: -3.1887 },
-    { name: 'Glasgow Central', code: 'GLC', lat: 55.8642, lng: -4.2592 },
-    { name: 'Bristol Temple Meads', code: 'BRI', lat: 51.4387, lng: -2.5821 },
-    { name: 'Cardiff Central', code: 'CDF', lat: 51.4761, lng: -3.1761 },
-    { name: 'Leeds City Station', code: 'LDS', lat: 53.7949, lng: -1.6477 },
-    { name: 'Newcastle Central', code: 'NCL', lat: 54.9687, lng: -1.6218 },
-    { name: 'Plymouth', code: 'PLY', lat: 50.3650, lng: -4.1416 },
-    { name: 'Exeter St David\'s', code: 'EXD', lat: 50.7184, lng: -3.5339 },
-    { name: 'Bath Spa', code: 'BAT', lat: 51.3844, lng: -2.3609 }
-];
+let ukStations = [];
+
+async function loadStations() {
+    try {
+        const response = await fetch('/api/stations');
+        if (!response.ok) throw new Error('Failed to load stations');
+        ukStations = await response.json();
+        console.log('✅ Loaded stations:', ukStations.length);
+    } catch (error) {
+        console.error('❌ Error loading stations:', error);
+    }
+}
 
 // ============================================
 // SEARCH FUNCTIONALITY
@@ -269,11 +309,13 @@ async function performSearch(query) {
     
     // Search live trains from the API
     const trainResults = liveTrains.filter(train =>
-        (train.name && train.name.toLowerCase().includes(query)) || // Search headcode
-        (train.station && train.station.toLowerCase().includes(query)) || // Search origin station
-        (train.destination && train.destination.toLowerCase().includes(query)) || // Search destination
-        (train.id && train.id.toLowerCase().includes(query)) // Search train ID
-    );
+    (train.name && train.name.toLowerCase().includes(query)) ||
+    (train.station && train.station.toLowerCase().includes(query)) ||
+    (train.destination && train.destination.toLowerCase().includes(query)) ||
+    (train.id && train.id.toLowerCase().includes(query)) ||
+    (train.unitNumber && train.unitNumber.toLowerCase().includes(query)) // ← FIX
+);
+
     
     console.log('✅ Results - Stations:', stationResults.length, 'Trains:', trainResults.length);
     
@@ -281,7 +323,9 @@ async function performSearch(query) {
     
     if (stationResults.length > 0) {
         resultsHTML += '<h3>Stations:</h3><ul>';
-        stationResults.forEach(station => {
+        // In case the API wraps the data in { stations: [] }, check both
+        const stationsList = stationResults.stations || stationResults;
+        stationsList.forEach(station => {
             resultsHTML += `<li><strong>${station.name}</strong> (${station.code}) - <button class="zoom-btn" data-lat="${station.lat}" data-lng="${station.lng}">Zoom Here</button></li>`;
         });
         resultsHTML += '</ul>';
@@ -327,45 +371,6 @@ async function performSearch(query) {
 }
 
 // ============================================
-// RAILWAY ARCHIVE
-// ============================================
-const archiveData = [
-    { year: 2025, month: 'December', entries: 485, link: '#' },
-    { year: 2025, month: 'November', entries: 512, link: '#' },
-    { year: 2025, month: 'October', entries: 498, link: '#' },
-    { year: 2024, month: 'Full Year', entries: 5843, link: '#' },
-    { year: 2023, month: 'Full Year', entries: 5612, link: '#' },
-    { year: 2022, month: 'Full Year', entries: 5420, link: '#' }
-];
-
-function displayArchive() {
-    const archiveModal = document.getElementById('archive-modal');
-    let archiveHTML = '<h2>Railway Archive</h2><table><thead><tr><th>Year</th><th>Period</th><th>Entries</th></tr></thead><tbody>';
-    
-    archiveData.forEach(record => {
-        archiveHTML += `<tr><td>${record.year}</td><td>${record.month}</td><td>${record.entries}</td></tr>`;
-    });
-    
-    archiveHTML += '</tbody></table>';
-    document.getElementById('archive-content').innerHTML = archiveHTML;
-    archiveModal.style.display = 'block';
-}
-
-// ============================================
-// MODAL HANDLING
-// ============================================
-function closeArchiveModal() {
-    document.getElementById('archive-modal').style.display = 'none';
-}
-
-window.onclick = function(event) {
-    const archiveModal = document.getElementById('archive-modal');
-    if (event.target == archiveModal) {
-        archiveModal.style.display = 'none';
-    }
-};
-
-// ============================================
 // SEARCH FORM SUBMISSION
 // ============================================
 function attachSearchListener() {
@@ -393,9 +398,13 @@ document.addEventListener('DOMContentLoaded', function() {
     console.log('📄 DOM Content Loaded - initializing app');
     document.getElementById('search-results').innerHTML = '<p>Search for a station or train to see results</p>';
     document.getElementById('train-list').innerHTML = '<p>Enter a search query to find trains</p>';
+    
+    // Load station database
+    loadStations();
+    
     attachSearchListener();
     requestUserLocation();
-    
+
     // Load comprehensive UK railway network
     loadRailwayNetwork();
-});        
+});

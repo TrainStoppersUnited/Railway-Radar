@@ -1,8 +1,8 @@
-const AWS = require('aws-sdk');
+    const AWS = require('aws-sdk');
 const fs = require('fs');
 const path = require('path');
-const zlib = require('zlib');
-require('dotenv').config();
+const zlib = require('zlib');               
+require('dotenv').config()  ;
 
 const s3 = new AWS.S3({
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,

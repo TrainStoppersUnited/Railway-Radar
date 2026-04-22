@@ -3,19 +3,116 @@ require('dotenv').config();
 const express = require('express');
 const AWS = require('aws-sdk');
 const cors = require('cors');
+const compression = require('compression');
 const xml2js = require('xml2js');
 const zlib = require('zlib');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { query, validationResult } = require('express-validator');
 const darwinKafka = require('./darwin-kafka');
 const TIPLOC_DATABASE = require('./tiploc-database');
+const dbService = require('./db');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
+// Pass io to request object if needed, or just emit globally
+io.on('connection', (socket) => {
+    console.log('Client connected to WebSockets:', socket.id);
+    socket.on('disconnect', () => {
+        console.log('Client disconnected:', socket.id);
+    });
+});
+
+    // Initialize the database on startup
+dbService.init();
+
+if (require.main === module) {
+    // Wait until variables are hoisted/defined
+    setTimeout(() => {
+        // Poll S3 automatically and broadcast to clients
+        setInterval(async () => {
+            await pollS3AndEmit();
+        }, 60000); // 60 seconds
+        
+        // Initial poll
+        pollS3AndEmit();
+    }, 1000);
+}
+
+// Function to handle the background fetch, cache and WS emit
+async function pollS3AndEmit() {
+    try {
+        console.log('🔄 Automatic S3 background poll...');
+        const { jsonData, latestFileKey } = await fetchLatestTimetableJson();
+        if (latestFileKey) {
+            const trains = parseTrainData(jsonData);
+            const enrichedTrains = enrichTrainsWithPushPort(trains);
+            const validatedTrains = enrichedTrains.filter(validateTrainRecord);
+
+            // Async persistence
+            setImmediate(() => {
+                dbService.saveTrainData(validatedTrains);
+            });
+
+            const response = { trains: validatedTrains, timestamp: new Date() };
+
+            lastKnownGoodTrainResponse = {
+                data: response,
+                timestamp: Date.now()
+            };
+            
+            // This will broadcast to WS
+            setCachedTrainData(response);
+        }
+    } catch (error) {
+        console.error('❌ Background S3 poll error:', error.message);
+        
+        const hasFallback = lastKnownGoodTrainResponse.data &&
+            lastKnownGoodTrainResponse.timestamp &&
+            (Date.now() - lastKnownGoodTrainResponse.timestamp) < FALLBACK_TTL;
+            
+        if (hasFallback) {
+            console.log('⚠️ Emitting stale in-memory fallback data to clients via WS');
+            io.emit('trains', {
+                ...lastKnownGoodTrainResponse.data,
+                stale: true,
+                error: 'Using last known data due to upstream error'
+            });
+        } else {
+            try {
+                const dbFallbacks = dbService.getLatestTrainPositions();
+                if (dbFallbacks && dbFallbacks.length > 0) {
+                    console.log('⚠️ Emitting historical SQLite fallback data to clients via WS');
+                    io.emit('trains', {
+                        trains: dbFallbacks,
+                        timestamp: new Date().toISOString(),
+                        stale: true,
+                        error: 'Using historical database data due to S3 crash'
+                    });
+                }
+            } catch (dbErr) {
+                console.error('❌ Database fallback lookup failed:', dbErr.message);
+            }
+        }
+    }
+}
 
 // Security middleware
 app.use(helmet({
     contentSecurityPolicy: false // Disable for Leaflet maps
 }));
+
+// Compression middleware
+app.use(compression({ threshold: 1024 }));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -28,6 +125,26 @@ app.use('/api/', limiter);
 // CORS and static files
 app.use(cors());
 app.use(express.static('./'));
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function s3RequestWithRetry(action, params, attempts = 3) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        try {
+            return await s3[action](params).promise();
+        } catch (error) {
+            if (attempt === attempts - 1) {
+                throw error;
+            }
+            const delay = 500 * Math.pow(2, attempt);
+            console.warn(`⚠️  S3 ${action} failed (attempt ${attempt + 1}/${attempts}):`, error.message);
+            await sleep(delay);
+        }
+    }
+    return null;
+}
 
 // Validate required environment variables
 if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
@@ -79,6 +196,13 @@ let timetableCache = {
     ttl: parseInt(process.env.CACHE_TTL) || 30000
 };
 
+let lastKnownGoodTrainResponse = {
+    data: null,
+    timestamp: null
+};
+
+const FALLBACK_TTL = parseInt(process.env.FALLBACK_TTL) || 24 * 60 * 60 * 1000; // 24 hours fallback limit
+
 function getCachedTrainData() {
     if (trainDataCache.data && 
         trainDataCache.timestamp && 
@@ -93,6 +217,7 @@ function setCachedTrainData(data) {
     trainDataCache.data = data;
     trainDataCache.timestamp = Date.now();
     console.log('💾 Train data cached');
+    io.emit('trains', data); // Push updates via WebSockets
 }
 
 function getCachedTimetableData() {
@@ -127,7 +252,7 @@ async function fetchLatestTimetableJson() {
     };
 
     console.log('📂 Listing S3 bucket files with prefix:', params.Prefix);
-    const listResponse = await s3.listObjectsV2(params).promise();
+    const listResponse = await s3RequestWithRetry('listObjectsV2', params);
     const files = listResponse.Contents || [];
 
     console.log('📊 S3 Files found:', files.length);
@@ -145,10 +270,10 @@ async function fetchLatestTimetableJson() {
 
     console.log('📄 Latest file:', latestFile.Key, '- Size:', latestFile.Size, 'bytes');
 
-    const fileResponse = await s3.getObject({
+    const fileResponse = await s3RequestWithRetry('getObject', {
         Bucket: 'darwin.xmltimetable',
         Key: latestFile.Key
-    }).promise();
+    });
 
     const compressedData = fileResponse.Body;
     console.log('📥 Compressed data received - Length:', compressedData.length, 'bytes');
@@ -188,7 +313,15 @@ app.get('/api/health', (req, res) => {
 // ============================================
 // GET LIVE TRAINS FROM DARWIN TIMETABLE
 // ============================================
-app.get('/api/trains', async (req, res) => {
+app.get('/api/trains', [
+    query('station').optional().isString().matches(/^[A-Z0-9]{3}$/i).withMessage('Invalid station code format')
+], async (req, res) => {
+    // Check validation errors
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+        return res.status(400).json({ error: errors.array()[0].msg });
+    }
+
     // Check cache first
     const cachedData = getCachedTrainData();
     if (cachedData) {
@@ -213,13 +346,51 @@ app.get('/api/trains', async (req, res) => {
 
         // Enrich trains with unit numbers from Push Port live feed
         const enrichedTrains = enrichTrainsWithPushPort(trains);
+        const validatedTrains = enrichedTrains.filter(validateTrainRecord);
 
-        const response = { trains: enrichedTrains, timestamp: new Date() };
+        // Async persistence so we don't block the HTTP response
+        setImmediate(() => {
+            dbService.saveTrainData(validatedTrains);
+        });
+
+        const response = { trains: validatedTrains, timestamp: new Date() };
+        lastKnownGoodTrainResponse = {
+            data: response,
+            timestamp: Date.now()
+        };
         setCachedTrainData(response);
         res.json(response);
     } catch (error) {
         console.error('❌ Error fetching trains from S3:', error.message);
         console.error('Full error:', error);
+        
+        const hasFallback = lastKnownGoodTrainResponse.data &&
+            lastKnownGoodTrainResponse.timestamp &&
+            (Date.now() - lastKnownGoodTrainResponse.timestamp) < FALLBACK_TTL;
+            
+        if (hasFallback) {
+            return res.json({
+                ...lastKnownGoodTrainResponse.data,
+                stale: true,
+                error: 'Using last known data due to upstream error'
+            });
+        } else {
+            // Attempt to load from database if memory cache is gone or expired
+            try {
+                const dbFallbacks = dbService.getLatestTrainPositions();
+                if (dbFallbacks && dbFallbacks.length > 0) {
+                    console.log(`⚠️  Using ${dbFallbacks.length} historical records from SQLite fallback`);
+                    return res.json({
+                        trains: dbFallbacks,
+                        timestamp: new Date().toISOString(),
+                        stale: true,
+                        error: 'Using historical database data due to upstream S3 crash'
+                    });
+                }
+            } catch (dbErr) {
+                console.error('❌ Database fallback failed:', dbErr.message);
+            }
+        }
         res.status(500).json({ error: 'Failed to fetch train data', message: error.message });
     }
 });
@@ -236,6 +407,7 @@ function parseTrainData(xmlJson) {
         
         const now = new Date();
         const todayStr = now.toISOString().slice(0, 10); // "YYYY-MM-DD"
+        const todayCompact = todayStr.replace(/-/g, ''); // "YYYYMMDD"
         const nowMinutes = now.getHours() * 60 + now.getMinutes(); // minutes since midnight
         
         console.log(`🕐 Current time: ${now.toTimeString().slice(0,5)}, today: ${todayStr}, nowMinutes: ${nowMinutes}`);
@@ -258,8 +430,11 @@ function parseTrainData(xmlJson) {
                 const attrs = journey.$ || {};
                 
                 // --- Filter 1: Only today's services ---
-                const serviceDate = attrs.ssd || '';
-                if (serviceDate && serviceDate !== todayStr) {
+                const serviceDate = (attrs.ssd || '').trim();
+                const normalizedServiceDate = serviceDate.includes('-')
+                    ? serviceDate
+                    : serviceDate.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
+                if (serviceDate && normalizedServiceDate !== todayStr && serviceDate !== todayCompact) {
                     skippedDate++;
                     return;
                 }
@@ -296,15 +471,9 @@ function parseTrainData(xmlJson) {
                 const depMinutes = parseTimeToMinutes(departureTimeStr);
                 const arrMinutes = parseTimeToMinutes(arrivalTimeStr);
                 
-                // --- Filter 3: Only currently running trains ---
-                // Allow a 5-min buffer before departure and 10-min buffer after arrival
+                // --- Filter 3: Keep upcoming services for search visibility ---
                 if (depMinutes !== null && nowMinutes < depMinutes - 5) {
                     skippedNotStarted++;
-                    return; // hasn't departed yet
-                }
-                if (arrMinutes !== null && nowMinutes > arrMinutes + 10) {
-                    skippedFinished++;
-                    return; // already arrived at destination
                 }
                 
                 // --- Build train object ---
@@ -372,13 +541,24 @@ function parseTrainData(xmlJson) {
             }
         });
         
-        console.log(`✅ Parsed ${trains.length} currently-running trains`);
-        console.log(`   Skipped: ${skippedDate} wrong date, ${skippedNonPassenger} non-passenger, ${skippedNotStarted} not started, ${skippedFinished} already finished`);
+        console.log(`✅ Parsed ${trains.length} same-day trains`);
+        console.log(`   Skipped: ${skippedDate} wrong date, ${skippedNonPassenger} non-passenger, ${skippedNotStarted} not started`);
     } catch (error) {
         console.warn('⚠️  Could not parse full Darwin data:', error.message);
     }
 
     return trains;
+}
+
+// ============================================
+// VALIDATE TRAIN RECORD
+// ============================================
+function validateTrainRecord(train) {
+    if (!train || !train.id) return false;
+    if (!Number.isFinite(train.lat) || !Number.isFinite(train.lng)) return false;
+    if (train.lat < 49 || train.lat > 61) return false;
+    if (train.lng < -8 || train.lng > 2) return false;
+    return true;
 }
 
 // ============================================
@@ -629,35 +809,39 @@ function getTrainPosition(originCode, destinationCode, depMinutes, arrMinutes, n
 }
 
 function getJourneyStops(journey) {
-    const groups = [
-        { key: 'OR', label: 'Origin' },
-        { key: 'OPOR', label: 'Origin' },
-        { key: 'IP', label: 'Calling point' },
-        { key: 'PP', label: 'Passing point' },
-        { key: 'OPIP', label: 'Operational point' },
-        { key: 'DT', label: 'Destination' },
-        { key: 'OPDT', label: 'Destination' }
-    ];
-
     const stops = [];
 
-    groups.forEach(group => {
-        normalizeToArray(journey[group.key]).forEach(point => {
-            const attrs = point.$ || {};
-            const code = attrs.tpl || null;
-            const station = getStationCoordinates(code);
-            stops.push({
-                code,
-                name: station.name || code || 'Unknown Station',
-                time: getPrimaryTime(attrs),
-                scheduledArrival: attrs.wta || attrs.pta || null,
-                scheduledDeparture: attrs.wtd || attrs.ptd || null,
-                passTime: attrs.wtp || attrs.ptp || null,
-                platform: attrs.plat || null,
-                type: group.label
-            });
+    const originPoints = normalizeToArray(journey.OR);
+    const operationalOrigins = normalizeToArray(journey.OPOR);
+    const destinationPoints = normalizeToArray(journey.DT);
+    const operationalDestinations = normalizeToArray(journey.OPDT);
+    const callingPoints = normalizeToArray(journey.IP);
+
+    const origins = originPoints.length ? originPoints : operationalOrigins;
+    const destinations = destinationPoints.length ? destinationPoints : operationalDestinations;
+
+    const addPoint = (point, type) => {
+        const attrs = point.$ || {};
+        const code = attrs.tpl || null;
+        const station = getStationCoordinates(code);
+        const fallbackName = attrs.locname || attrs.locName || attrs.tiploc || null;
+        const name = (station.name === code && fallbackName) ? fallbackName : (station.name || code || 'Unknown Station');
+
+        stops.push({
+            code,
+            name,
+            time: getPrimaryTime(attrs),
+            scheduledArrival: attrs.wta || attrs.pta || null,
+            scheduledDeparture: attrs.wtd || attrs.ptd || null,
+            passTime: attrs.wtp || attrs.ptp || null,
+            platform: attrs.plat || null,
+            type
         });
-    });
+    };
+
+    origins.forEach(point => addPoint(point, 'Origin'));
+    callingPoints.forEach(point => addPoint(point, 'Calling point'));
+    destinations.forEach(point => addPoint(point, 'Destination'));
 
     return stops;
 }
@@ -667,6 +851,14 @@ function getJourneyUnitNumbers(journey, attrs) {
     const rid = attrs.rid || null;
     const trainId = attrs.trainId || null;
     const uid = attrs.uid || null;
+
+    // Include timetable formation unit numbers when present.
+    if (journey.Formations && journey.Formations.length > 0) {
+        const formation = journey.Formations[0];
+        if (formation?.$?.fid) {
+            formation.$.fid.split('+').forEach(unit => numbers.add(unit));
+        }
+    }
 
     const pushPortTrain = darwinKafka.getLiveTrainsWithFormations().find(train =>
         (rid && train.rid === rid) ||
@@ -763,7 +955,6 @@ app.get('/api/trains/:rid/details', async (req, res) => {
 // ============================================
 app.get('/api/stations', async (req, res) => {
     try {
-        // Fetch from S3 reference data or use cached version
         const stations = [
             { name: 'London King\'s Cross', code: 'KGX', lat: 51.5307, lng: -0.1234 },
             { name: 'London St Pancras', code: 'STP', lat: 51.5330, lng: -0.1254 },
@@ -780,7 +971,7 @@ app.get('/api/stations', async (req, res) => {
             { name: 'Exeter St David\'s', code: 'EXD', lat: 50.7184, lng: -3.5339 },
             { name: 'Bath Spa', code: 'BAT', lat: 51.3844, lng: -2.3609 }
         ];
-        res.json({ stations });
+        res.json(stations);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch stations' });
     }
@@ -796,17 +987,33 @@ function enrichTrainsWithPushPort(trains) {
     const ridMap = new Map();     // RID -> push port train
     const trainIdMap = new Map(); // headcode -> push port train
     const uidMap = new Map();     // UID -> push port train
+
+    function normalizeHeadcode(value) {
+        if (!value) return null;
+        return String(value).trim().toUpperCase();
+    }
+
+    function isHeadcode(value) {
+        return /^[0-9][A-Z][0-9]{2}$/.test(value);
+    }
     
     for (const ppTrain of pushPortTrains) {
         if (ppTrain.rid) ridMap.set(ppTrain.rid, ppTrain);
-        if (ppTrain.trainId) trainIdMap.set(ppTrain.trainId, ppTrain);
+        const normalizedTrainId = normalizeHeadcode(ppTrain.trainId);
+        if (normalizedTrainId && isHeadcode(normalizedTrainId)) {
+            trainIdMap.set(normalizedTrainId, ppTrain);
+        }
         if (ppTrain.uid) uidMap.set(ppTrain.uid, ppTrain);
     }
     
     return trains.map(train => {
+        const normalizedName = normalizeHeadcode(train.name);
+        const normalizedId = normalizeHeadcode(train.id);
+
         // Try matching by RID first, then headcode (trainId), then UID
         const ppMatch = ridMap.get(train.id) || 
-                        trainIdMap.get(train.name) || 
+                        (normalizedName && isHeadcode(normalizedName) ? trainIdMap.get(normalizedName) : null) || 
+                        (normalizedId && isHeadcode(normalizedId) ? trainIdMap.get(normalizedId) : null) || 
                         uidMap.get(train.uid);
         
         if (ppMatch) {
@@ -846,7 +1053,6 @@ app.get('/api/pushport/status', (req, res) => {
 // ============================================
 // GRACEFUL SHUTDOWN
 // ============================================
-let server;
 
 async function shutdown() {
     console.log('\n🛑 Shutting down gracefully...');
@@ -868,21 +1074,25 @@ process.on('SIGINT', shutdown);
 // START SERVER
 // ============================================
 const PORT = process.env.PORT || 3000;
-server = app.listen(PORT, async () => {
-    console.log(`🚂 Railway Radar server running on http://localhost:${PORT}`);
-    console.log(`📡 API endpoints:`);
-    console.log(`   - GET /api/trains`);
-    console.log(`   - GET /api/stations`);
-    console.log(`   - GET /api/health`);
-    console.log(`   - GET /api/pushport/trains`);
-    console.log(`   - GET /api/pushport/status`);
-    
-    // Start Darwin Push Port Kafka consumer
-    const kafkaStarted = await darwinKafka.startDarwinConsumer();
-    if (kafkaStarted) {
-        console.log('✅ Darwin Push Port live feed active - unit numbers will be available');
-    } else {
-        console.log('⚠️  Darwin Push Port not started - using timetable data only (no unit numbers)');
-        console.log('   To enable: set KAFKA_API_KEY and KAFKA_API_SECRET in .env');
-    }
-});
+if (require.main === module) {
+    server.listen(PORT, async () => {
+        console.log(`🚂 Railway Radar server running on http://localhost:${PORT}`);
+        console.log(`📡 API endpoints:`);
+        console.log(`   - GET /api/trains`);
+        console.log(`   - GET /api/stations`);
+        console.log(`   - GET /api/health`);
+        console.log(`   - GET /api/pushport/trains`);
+        console.log(`   - GET /api/pushport/status`);
+
+        // Start Darwin Push Port Kafka consumer
+        const kafkaStarted = await darwinKafka.startDarwinConsumer();
+        if (kafkaStarted) {
+            console.log('✅ Darwin Push Port live feed active - unit numbers will be available');
+        } else {
+            console.log('⚠️  Darwin Push Port not started - using timetable data only (no unit numbers)');
+            console.log('   To enable: set KAFKA_API_KEY and KAFKA_API_SECRET in .env');
+        }
+    });
+}
+
+module.exports = app;

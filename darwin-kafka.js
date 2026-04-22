@@ -467,9 +467,9 @@ function getLiveTrainsWithFormations() {
     const trains = [];
     
     for (const [rid, train] of liveTrainStore) {
-        // Only include passenger services with recent updates (last 30 mins)
+        // Only include passenger services with recent updates (last 360 mins)
         const age = Date.now() - (train.lastUpdated?.getTime() || 0);
-        if (age > 30 * 60 * 1000) continue;
+        if (age > 360 * 60 * 1000) continue;
         if (train.isPassengerService === false) continue;
 
         const formation = formationStore.get(rid);
